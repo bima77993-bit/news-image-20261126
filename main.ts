@@ -1,87 +1,82 @@
-// news-image-20261126 — entrypoint.
-// Copies the pre-rendered 1024x1024 news image (entry.png, in this repo)
-// to $MAKEFUN_OUTPUT_DIR/entry.png (fallback: /output/entry.png).
-// The image itself is a static file: it is rendered once, deterministically,
-// from HTML + headless Chrome, and only copied here. This program validates
-// the PNG before copying so a corrupt file can never be submitted silently.
-
-import { copyFileSync, mkdirSync, readFileSync, statSync } from "node:fs";
+// Entry point for news-image-20261126 (round 2): "Thursday 26 November 2026".
+// Validates the bundled entry.png (PNG signature) and copies it to the
+// harness output directory as entry.png. Node 22, standard library only.
+import { copyFile, mkdir, readFile, stat } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
+const HERE = dirname(fileURLToPath(import.meta.url));
+const SRC = join(HERE, "entry.png");
+const OUT_DIR = process.env.MAKEFUN_OUTPUT_DIR ?? join(HERE, "output");
+const OUT = join(OUT_DIR, "entry.png");
+
+// The 8-byte PNG file signature every valid PNG starts with.
 const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
-const MAX_BYTES = 1024 * 1024; // competition limit: 1 MiB
 
-const here = dirname(fileURLToPath(import.meta.url));
-const source = join(here, "entry.png");
-const outDir = process.env.MAKEFUN_OUTPUT_DIR || "/output/entry.png";
-const target = outDir.endsWith(".png") ? outDir : join(outDir, "entry.png");
-
-const png = readFileSync(source);
-if (png.length > MAX_BYTES) {
-  throw new Error(`entry.png is ${png.length} bytes, over the 1 MiB limit`);
-}
-if (png.length < 8 || !png.subarray(0, 8).equals(PNG_SIGNATURE)) {
-  throw new Error("entry.png is not a valid PNG (bad signature)");
+const bytes = await readFile(SRC);
+if (bytes.length < PNG_SIGNATURE.length || !bytes.subarray(0, 8).equals(PNG_SIGNATURE)) {
+  throw new Error("entry.png is not a PNG file (bad signature)");
 }
 
-// CRC-32 (IEEE 802.3, polynomial 0xedb88320) chunk walk: every PNG chunk
-// carries a CRC over its type + data. A single flipped byte anywhere in
-// the file must fail the run instead of shipping a corrupt image.
+// Walk every PNG chunk and verify its CRC-32, so a truncated or corrupted
+// file is caught here instead of silently shipping a broken image.
 const CRC_TABLE = (() => {
-  const table = new Int32Array(256);
+  const table = new Uint32Array(256);
   for (let n = 0; n < 256; n++) {
     let c = n;
     for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
-    table[n] = c;
+    table[n] = c >>> 0;
   }
   return table;
 })();
 
 function crc32(buf) {
   let c = 0xffffffff;
-  for (let i = 0; i < buf.length; i++) c = CRC_TABLE[(c ^ buf[i]) & 0xff] ^ (c >>> 8);
+  for (const b of buf) c = CRC_TABLE[(c ^ b) & 0xff] ^ (c >>> 8);
   return (c ^ 0xffffffff) >>> 0;
 }
 
 let offset = 8;
-let firstChunk = true;
-let seenIend = false;
 let chunkCount = 0;
-while (offset + 8 <= png.length) {
-  const length = png.readUInt32BE(offset);
-  const type = png.toString("latin1", offset + 4, offset + 8);
-  if (offset + 12 + length > png.length) {
-    throw new Error(`PNG chunk ${type} at offset ${offset} is truncated`);
+let sawIend = false;
+while (offset + 8 <= bytes.length) {
+  const length = bytes.readUInt32BE(offset);
+  const type = bytes.toString("ascii", offset + 4, offset + 8);
+  const dataStart = offset + 8;
+  const dataEnd = dataStart + length;
+  const crcEnd = dataEnd + 4;
+  if (crcEnd > bytes.length) throw new Error(`entry.png: chunk ${type} is truncated`);
+  const stored = bytes.readUInt32BE(dataEnd);
+  const computed = crc32(bytes.subarray(offset + 4, dataEnd));
+  if (stored !== computed) {
+    throw new Error(`entry.png: CRC mismatch in chunk ${type}`);
   }
-  const storedCrc = png.readUInt32BE(offset + 8 + length);
-  const actualCrc = crc32(png.subarray(offset + 4, offset + 8 + length));
-  if (storedCrc !== actualCrc) {
-    throw new Error(`PNG chunk ${type} at offset ${offset} fails CRC check`);
-  }
-  if (firstChunk && type !== "IHDR") throw new Error("first PNG chunk is not IHDR");
-  firstChunk = false;
-  if (type === "IHDR") {
-    const width = png.readUInt32BE(offset + 8);
-    const height = png.readUInt32BE(offset + 12);
-    if (width !== 1024 || height !== 1024) {
-      throw new Error(`entry.png is ${width}x${height}, expected 1024x1024`);
-    }
-  }
-  if (type === "IEND") seenIend = true;
   chunkCount++;
-  offset += 12 + length;
+  if (type === "IEND") { sawIend = true; break; }
+  offset = crcEnd;
 }
-if (!seenIend || offset !== png.length) {
-  throw new Error("PNG is missing IEND or has trailing bytes");
-}
-console.log(`PNG valid: ${chunkCount} chunks, CRC-32 walk passed`);
+if (!sawIend) throw new Error("entry.png: missing IEND chunk");
+console.log(`entry.png chunks OK (${chunkCount} chunks, CRC-32 verified)`);
 
-mkdirSync(dirname(target), { recursive: true });
-copyFileSync(source, target);
-
-const written = statSync(target);
-if (written.size !== png.length) {
-  throw new Error(`copy failed: wrote ${written.size} bytes, expected ${png.length}`);
+// The first chunk must be IHDR; its width/height fields pin the image to
+// the competition's 1024x1024 canvas, and the file must stay under 1 MiB.
+const ihdrLength = bytes.readUInt32BE(8);
+const ihdrType = bytes.toString("ascii", 12, 16);
+if (ihdrType !== "IHDR" || ihdrLength !== 13) {
+  throw new Error("entry.png: first chunk is not a valid IHDR");
 }
-console.log(`wrote ${target} (${written.size} bytes)`);
+const width = bytes.readUInt32BE(16);
+const height = bytes.readUInt32BE(20);
+if (width !== 1024 || height !== 1024) {
+  throw new Error(`entry.png: expected 1024x1024, got ${width}x${height}`);
+}
+if (bytes.length > 1024 * 1024) {
+  throw new Error(`entry.png: ${bytes.length} bytes exceeds the 1 MiB limit`);
+}
+console.log(`entry.png dimensions OK (${width}x${height}, ${bytes.length} bytes)`);
+
+await mkdir(OUT_DIR, { recursive: true });
+await copyFile(SRC, OUT);
+
+const outStat = await stat(OUT);
+console.log(`entry.png OK (${bytes.length} bytes) -> ${OUT} (${outStat.size} bytes)`);
