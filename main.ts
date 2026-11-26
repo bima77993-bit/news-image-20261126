@@ -1,82 +1,99 @@
-// Entry point for news-image-20261126 (round 2): "Thursday 26 November 2026".
-// Validates the bundled entry.png (PNG signature) and copies it to the
-// harness output directory as entry.png. Node 22, standard library only.
-import { copyFile, mkdir, readFile, stat } from "node:fs/promises";
+// Round 3 entry for news-image-20261126 ("The World in One Page").
+// Validates the bundled entry.png (1024x1024 RGB, <= 1 MiB) and writes it
+// deterministically to $MAKEFUN_OUTPUT_DIR/entry.png (default: ./out).
+// Node 22+ stdlib only; no dependencies.
+
+import { createHash } from "node:crypto";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-const HERE = dirname(fileURLToPath(import.meta.url));
-const SRC = join(HERE, "entry.png");
-const OUT_DIR = process.env.MAKEFUN_OUTPUT_DIR ?? join(HERE, "output");
-const OUT = join(OUT_DIR, "entry.png");
+const MAX_BYTES = 1_048_576;
+const WANT_W = 1024;
+const WANT_H = 1024;
 
-// The 8-byte PNG file signature every valid PNG starts with.
-const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
-
-const bytes = await readFile(SRC);
-if (bytes.length < PNG_SIGNATURE.length || !bytes.subarray(0, 8).equals(PNG_SIGNATURE)) {
-  throw new Error("entry.png is not a PNG file (bad signature)");
+// CRC-32 (IEEE 802.3) table, built once at startup.
+const CRC_TABLE: number[] = [];
+for (let n = 0; n < 256; n++) {
+  let c = n;
+  for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+  CRC_TABLE.push(c >>> 0);
 }
 
-// Walk every PNG chunk and verify its CRC-32, so a truncated or corrupted
-// file is caught here instead of silently shipping a broken image.
-const CRC_TABLE = (() => {
-  const table = new Uint32Array(256);
-  for (let n = 0; n < 256; n++) {
-    let c = n;
-    for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
-    table[n] = c >>> 0;
-  }
-  return table;
-})();
-
-function crc32(buf) {
-  let c = 0xffffffff;
-  for (const b of buf) c = CRC_TABLE[(c ^ b) & 0xff] ^ (c >>> 8);
-  return (c ^ 0xffffffff) >>> 0;
+function crc32(buf: Buffer): number {
+  let crc = 0xffffffff;
+  for (const byte of buf) crc = CRC_TABLE[(crc ^ byte) & 0xff] ^ (crc >>> 8);
+  return (crc ^ 0xffffffff) >>> 0;
 }
 
+function fail(msg: string): never {
+  throw new Error(`entry.png validation failed: ${msg}`);
+}
+
+const here = dirname(fileURLToPath(import.meta.url));
+const srcPath = join(here, "entry.png");
+if (!existsSync(srcPath)) fail(`missing ${srcPath}`);
+
+const png = readFileSync(srcPath);
+if (png.length > MAX_BYTES) fail(`size ${png.length} exceeds ${MAX_BYTES} bytes`);
+if (png.length < 8) fail("file too short to be a PNG");
+
+const MAGIC = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+if (!png.subarray(0, 8).equals(MAGIC)) fail("bad PNG signature");
+
+// Walk every chunk, verifying CRCs and the IHDR header.
 let offset = 8;
-let chunkCount = 0;
-let sawIend = false;
-while (offset + 8 <= bytes.length) {
-  const length = bytes.readUInt32BE(offset);
-  const type = bytes.toString("ascii", offset + 4, offset + 8);
-  const dataStart = offset + 8;
-  const dataEnd = dataStart + length;
-  const crcEnd = dataEnd + 4;
-  if (crcEnd > bytes.length) throw new Error(`entry.png: chunk ${type} is truncated`);
-  const stored = bytes.readUInt32BE(dataEnd);
-  const computed = crc32(bytes.subarray(offset + 4, dataEnd));
-  if (stored !== computed) {
-    throw new Error(`entry.png: CRC mismatch in chunk ${type}`);
+let seenIHDR = false;
+let seenIEND = false;
+let idatBytes = 0;
+let width = 0;
+let height = 0;
+let first = true;
+while (offset < png.length) {
+  if (offset + 8 > png.length) fail(`truncated chunk header at ${offset}`);
+  const len = png.readUInt32BE(offset);
+  const type = png.subarray(offset + 4, offset + 8).toString("latin1");
+  if (first && type !== "IHDR") fail(`first chunk is ${type}, expected IHDR`);
+  first = false;
+  if (type === "IDAT") idatBytes += len;
+  if (offset + 12 + len > png.length) fail(`truncated ${type} chunk at ${offset}`);
+  const data = png.subarray(offset + 8, offset + 8 + len);
+  const storedCrc = png.readUInt32BE(offset + 8 + len);
+  const actualCrc = crc32(Buffer.concat([png.subarray(offset + 4, offset + 8), data]));
+  if (storedCrc !== actualCrc) fail(`${type} chunk CRC mismatch`);
+  if (type === "IHDR") {
+    if (seenIHDR) fail("duplicate IHDR");
+    seenIHDR = true;
+    if (len !== 13) fail("IHDR length is not 13");
+    width = data.readUInt32BE(0);
+    height = data.readUInt32BE(4);
+    const bitDepth = data[8];
+    const colorType = data[9];
+    if (width !== WANT_W || height !== WANT_H) {
+      fail(`dimensions ${width}x${height}, expected ${WANT_W}x${WANT_H}`);
+    }
+    if (bitDepth !== 8 || colorType !== 2) {
+      fail(`expected 8-bit RGB (depth 8, color 2), got depth ${bitDepth}, color ${colorType}`);
+    }
   }
-  chunkCount++;
-  if (type === "IEND") { sawIend = true; break; }
-  offset = crcEnd;
+  if (type === "IEND") {
+    if (len !== 0) fail("IEND must be empty");
+    seenIEND = true;
+    offset += 12 + len;
+    break;
+  }
+  offset += 12 + len;
 }
-if (!sawIend) throw new Error("entry.png: missing IEND chunk");
-console.log(`entry.png chunks OK (${chunkCount} chunks, CRC-32 verified)`);
+if (!seenIHDR) fail("no IHDR chunk");
+if (!seenIEND) fail("no IEND chunk");
+if (idatBytes === 0) fail("no IDAT image data");
+if (offset !== png.length) fail(`${png.length - offset} trailing bytes after IEND`);
 
-// The first chunk must be IHDR; its width/height fields pin the image to
-// the competition's 1024x1024 canvas, and the file must stay under 1 MiB.
-const ihdrLength = bytes.readUInt32BE(8);
-const ihdrType = bytes.toString("ascii", 12, 16);
-if (ihdrType !== "IHDR" || ihdrLength !== 13) {
-  throw new Error("entry.png: first chunk is not a valid IHDR");
-}
-const width = bytes.readUInt32BE(16);
-const height = bytes.readUInt32BE(20);
-if (width !== 1024 || height !== 1024) {
-  throw new Error(`entry.png: expected 1024x1024, got ${width}x${height}`);
-}
-if (bytes.length > 1024 * 1024) {
-  throw new Error(`entry.png: ${bytes.length} bytes exceeds the 1 MiB limit`);
-}
-console.log(`entry.png dimensions OK (${width}x${height}, ${bytes.length} bytes)`);
+const outDir = process.env.MAKEFUN_OUTPUT_DIR ?? join(here, "out");
+mkdirSync(outDir, { recursive: true });
+const outPath = join(outDir, "entry.png");
+writeFileSync(outPath, png);
 
-await mkdir(OUT_DIR, { recursive: true });
-await copyFile(SRC, OUT);
-
-const outStat = await stat(OUT);
-console.log(`entry.png OK (${bytes.length} bytes) -> ${OUT} (${outStat.size} bytes)`);
+const sha = createHash("sha256").update(png).digest("hex");
+console.log(`validated entry.png: ${width}x${height} RGB, ${png.length} bytes, sha256 ${sha}`);
+console.log(`wrote ${outPath}`);
